@@ -1,173 +1,166 @@
 import streamlit as st
-import numpy as np
 import cv2
+import numpy as np
 from PIL import Image
-from io import BytesIO
+import io
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
-st.set_page_config(page_title="MatrixScan", page_icon="📄", layout="wide")
-
-st.title("📄 MatrixScan")
-st.caption("Document scanner powered by Linear Algebra")
-st.write(
-    "Upload a tilted document, set its four corners, correct the perspective, "
-    "enhance the result, and download it as a PDF."
+# Page config
+st.set_page_config(
+    page_title="MatrixScan - Modern Document Scanner",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-uploaded = st.file_uploader(
-    "Upload a document photo",
-    type=["jpg", "jpeg", "png"]
-)
-
-def order_points(points):
-    """Return points in top-left, top-right, bottom-right, bottom-left order."""
-    pts = np.array(points, dtype=np.float32)
-    s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1).reshape(-1)
-    return np.array([
-        pts[np.argmin(s)],       # top-left
-        pts[np.argmin(diff)],    # top-right
-        pts[np.argmax(s)],      # bottom-right
-        pts[np.argmax(diff)]    # bottom-left
-    ], dtype=np.float32)
-
-def make_pdf(image_rgb):
-    """Convert an RGB image into downloadable one-page PDF bytes."""
-    pil_image = Image.fromarray(image_rgb).convert("RGB")
-    buffer = BytesIO()
-    pil_image.save(buffer, format="PDF", resolution=150.0)
-    return buffer.getvalue()
-
-if uploaded is not None:
-    file_bytes = np.frombuffer(uploaded.getvalue(), dtype=np.uint8)
-    bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    if bgr is None:
-        st.error("The image could not be read. Please upload another JPG or PNG.")
-        st.stop()
-
-    image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    height, width = image.shape[:2]
-
-    st.subheader("1. Original document")
-    st.image(image, use_container_width=True)
-
-    st.subheader("2. Set the four document corners")
-    st.info(
-        "Enter the pixel coordinates of the four corners. "
-        "Use the original image above as a guide. Coordinates must be within the image."
-    )
-
-    default_points = {
-        "Top-left X": int(width * 0.15),
-        "Top-left Y": int(height * 0.15),
-        "Top-right X": int(width * 0.85),
-        "Top-right Y": int(height * 0.15),
-        "Bottom-right X": int(width * 0.85),
-        "Bottom-right Y": int(height * 0.85),
-        "Bottom-left X": int(width * 0.15),
-        "Bottom-left Y": int(height * 0.85),
+# Custom Glassmorphism & Modern Aesthetic CSS
+st.markdown("""
+<style>
+    /* Dark Aesthetic Background */
+    .stApp {
+        background: linear-gradient(135deg, #0f0c20 0%, #150a19 50%, #05020a 100%);
+        color: #f0f2f5;
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
     }
 
-    cols = st.columns(4)
-    labels = list(default_points.keys())
-    values = {}
-    for i, label in enumerate(labels):
-        with cols[i % 4]:
-            values[label] = st.number_input(
-                label, min_value=0, max_value=max(width, height),
-                value=min(default_points[label], max(width, height)),
-                step=1
+    /* Glassmorphism Cards */
+    div[data-testid="stExpander"], div.stMarkdown > div {
+        border-radius: 16px;
+    }
+    
+    .css-card {
+        background: rgba(255, 255, 255, 0.04);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 20px;
+        padding: 24px;
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        margin-bottom: 20px;
+    }
+
+    /* Glowing Gradient Title */
+    .main-title {
+        font-size: 3rem !important;
+        font-weight: 800;
+        background: linear-gradient(135deg, #ff416c 0%, #8a2387 50%, #e94057 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-shadow: 0 0 30px rgba(233, 64, 87, 0.3);
+        margin-bottom: 5px;
+    }
+
+    .sub-title {
+        color: #a0aec0;
+        font-size: 1.1rem;
+        margin-bottom: 30px;
+    }
+
+    /* Styled Buttons */
+    .stButton>button {
+        background: linear-gradient(135deg, #8a2387 0%, #e94057 100%) !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 12px !important;
+        padding: 12px 28px !important;
+        font-weight: 600 !important;
+        box-shadow: 0 4px 15px rgba(233, 64, 87, 0.4) !important;
+        transition: all 0.3s ease !important;
+    }
+
+    .stButton>button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(233, 64, 87, 0.6) !important;
+    }
+
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: rgba(15, 12, 32, 0.8) !important;
+        border-right: 1px solid rgba(255, 255, 255, 0.08);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# App Header
+st.markdown('<div class="main-title">MatrixScan</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Linear Algebra Powered Document Scanner & PDF Generator</div>', unsafe_allow_html=True)
+
+# Main UI layout using columns
+col1, col2 = st.columns([1, 1], gap="large")
+
+with col1:
+    st.markdown("### 📤 Upload Document")
+    uploaded_file = st.file_uploader("Choose a crooked or angled photo", type=["jpg", "jpeg", "png"])
+    
+    if uploaded_file is not None:
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Original Input Image", use_container_width=True)
+
+with col2:
+    st.markdown("### ⚙️ Transformation Settings")
+    if uploaded_file is not None:
+        st.info("Coordinates represent the 4 corners of your document in the photo.")
+        
+        # Default coordinates or user inputs
+        img_np = np.array(image)
+        h, w = img_np.shape[:0] if len(img_np.shape) == 3 else img_np.shape
+        
+        # Coordinates input UI
+        st.write("**Select Corner Points (x, y):**")
+        c1 = st.columns(2)
+        top_left_x = c1[0].number_input("Top Left X", value=int(w * 0.1))
+        top_left_y = c1[1].number_input("Top Left Y", value=int(h * 0.1))
+        
+        c2 = st.columns(2)
+        top_right_x = c2[0].number_input("Top Right X", value=int(w * 0.9))
+        top_right_y = c2[1].number_input("Top Right Y", value=int(h * 0.1))
+        
+        c3 = st.columns(2)
+        bottom_right_x = c3[0].number_input("Bottom Right X", value=int(w * 0.9))
+        bottom_right_y = c3[1].number_input("Bottom Right Y", value=int(h * 0.9))
+        
+        c4 = st.columns(2)
+        bottom_left_x = c4[0].number_input("Bottom Left X", value=int(w * 0.1))
+        bottom_left_y = c4[1].number_input("Bottom Left Y", value=int(h * 0.9))
+        
+        if st.button("✨ Apply Homography Matrix & Scan"):
+            # Source points from user input
+            pts1 = np.float32([
+                [top_left_x, top_left_y],
+                [top_right_x, top_right_y],
+                [bottom_right_x, bottom_right_y],
+                [bottom_left_x, bottom_left_y]
+            ])
+            
+            # Target dimensions
+            width, height = 800, 1050
+            pts2 = np.float32([
+                [0, 0],
+                [width, 0],
+                [width, height],
+                [0, height]
+            ])
+            
+            # 3x3 Homography Matrix calculation
+            matrix = cv2.getPerspectiveTransform(pts1, pts2)
+            scanned = cv2.warpPerspective(img_np, matrix, (width, height))
+            
+            # Display Result
+            st.markdown("---")
+            st.markdown("### 🎯 Scanned Result")
+            st.image(scanned, caption="Perspective Corrected Document", use_container_width=True)
+            
+            # Convert to PDF
+            scanned_pil = Image.fromarray(scanned)
+            img_byte_arr = io.BytesIO()
+            scanned_pil.save(img_byte_arr, format='PDF')
+            
+            st.download_button(
+                label="📥 Download Scanned PDF",
+                data=img_byte_arr.getvalue(),
+                file_name="MatrixScan_Document.pdf",
+                mime="application/pdf"
             )
-
-    corners = [
-        [values["Top-left X"], values["Top-left Y"]],
-        [values["Top-right X"], values["Top-right Y"]],
-        [values["Bottom-right X"], values["Bottom-right Y"]],
-        [values["Bottom-left X"], values["Bottom-left Y"]],
-    ]
-
-    valid = all(0 <= x < width and 0 <= y < height for x, y in corners)
-    if not valid:
-        st.error(f"All points must be inside the image ({width} × {height}).")
-        st.stop()
-
-    if st.button("✨ Correct perspective", type="primary"):
-        src = order_points(corners)
-
-        tl, tr, br, bl = src
-        out_width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
-        out_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
-        out_width = max(out_width, 100)
-        out_height = max(out_height, 100)
-
-        destination = np.array([
-            [0, 0],
-            [out_width - 1, 0],
-            [out_width - 1, out_height - 1],
-            [0, out_height - 1]
-        ], dtype=np.float32)
-
-        # Linear Algebra: calculate a 3 x 3 homography matrix from four point pairs.
-        H = cv2.getPerspectiveTransform(src, destination)
-
-        # Apply the transformation matrix to remap the image into a rectangle.
-        corrected = cv2.warpPerspective(image, H, (out_width, out_height))
-
-        st.session_state["corrected"] = corrected
-        st.session_state["matrix"] = H
-
-    if "corrected" in st.session_state:
-        corrected = st.session_state["corrected"]
-        H = st.session_state["matrix"]
-
-        st.subheader("3. Corrected document")
-        left, right = st.columns(2)
-        with left:
-            st.image(corrected, caption="Perspective-corrected image", use_container_width=True)
-        with right:
-            st.markdown("**Calculated 3 × 3 homography matrix**")
-            st.dataframe(np.round(H, 4), use_container_width=True)
-
-        st.subheader("4. Enhance and export")
-        mode = st.selectbox(
-            "Choose an enhancement",
-            ["Original colour", "Grayscale", "Black & white"]
-        )
-
-        if mode == "Grayscale":
-            output = cv2.cvtColor(corrected, cv2.COLOR_RGB2GRAY)
-            output = cv2.cvtColor(output, cv2.COLOR_GRAY2RGB)
-        elif mode == "Black & white":
-            gray = cv2.cvtColor(corrected, cv2.COLOR_RGB2GRAY)
-            _, binary = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
-            output = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
-        else:
-            output = corrected
-
-        st.image(output, caption=f"Final result: {mode}", use_container_width=True)
-
-        pdf_bytes = make_pdf(output)
-        st.download_button(
-            "⬇️ Download scanned PDF",
-            data=pdf_bytes,
-            file_name="MatrixScan_document.pdf",
-            mime="application/pdf"
-        )
-        st.download_button(
-            "⬇️ Download corrected image",
-            data=cv2.imencode(".png", cv2.cvtColor(output, cv2.COLOR_RGB2BGR))[1].tobytes(),
-            file_name="MatrixScan_document.png",
-            mime="image/png"
-        )
-else:
-    st.info("Upload a JPG or PNG image to begin.")
-    st.markdown(
-        "**How it works:** Upload → enter four corner coordinates → "
-        "calculate the homography matrix → correct → enhance → download PDF."
-    )
-
-st.divider()
-st.caption("MatrixScan is an educational demonstration of perspective transformation. "
-           "It does not automatically detect document corners.")
+    else:
+        st.warning("Please upload a document photo on the left to activate settings.")
