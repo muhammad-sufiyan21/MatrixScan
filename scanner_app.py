@@ -122,21 +122,27 @@ def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
     return warped
 
+import tempfile
+
 def make_pdf(images: list[np.ndarray]) -> bytes:
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=letter)
     page_w, page_h = letter
     for arr in images:
         pil = Image.fromarray(arr).convert("RGB")
-        img_buffer = io.BytesIO()
-        pil.save(img_buffer, format="JPEG", quality=92)
-        img_buffer.seek(0)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            pil.save(tmp.name, format="JPEG", quality=92)
+            tmp_name = tmp.name
         iw, ih = pil.size
         scale = min((page_w - 48) / iw, (page_h - 48) / ih)
         draw_w, draw_h = iw * scale, ih * scale
-        pdf.drawImage(img_buffer, (page_w - draw_w) / 2, (page_h - draw_h) / 2,
+        pdf.drawImage(tmp_name, (page_w - draw_w) / 2, (page_h - draw_h) / 2,
                       width=draw_w, height=draw_h, preserveAspectRatio=True)
         pdf.showPage()
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
     pdf.save()
     return buffer.getvalue()
 
