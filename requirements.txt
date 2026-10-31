@@ -1,4 +1,5 @@
 streamlit
+opencv-phyton-headless
 numpy
-opencv-python-headless
-pillow
+Pillow
+reportlab
