@@ -104,7 +104,7 @@ with col2:
         
         # Default coordinates or user inputs
         img_np = np.array(image)
-        h, w = img_np.shape[:0] if len(img_np.shape) == 3 else img_np.shape
+        h, w = img_np.shape[:2] if len(img_np.shape) == 3 else img_np.shape
         
         # Coordinates input UI
         st.write("**Select Corner Points (x, y):**")
