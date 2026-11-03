@@ -124,22 +124,7 @@ def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
     if mode == "Grayscale":
         gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
         return cv2.cvtColor(gray_w, cv2.COLOR_GRAY2RGB)
-    return warped
-    if mode == "Black & White":
-        gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
-        bw = cv2.adaptiveThreshold(gray_w, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 21, 11)
-        return cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
-    if mode == "Grayscale":
-        gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
-        return cv2.cvtColor(gray_w, cv2.COLOR_GRAY2RGB)
-    return warped
-    # Current automatic crop is a gentle edge margin. This can later be replaced
-    # with contour-based document-edge detection and draggable corner controls.
-    points = np.float32([
-        [w * .025, h * .025], [w * .975, h * .025],
-        [w * .975, h * .975], [w * .025, h * .975]
-    ])
+    return warped    ])
     out_w, out_h = 1000, 1400
     target = np.float32([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]])
     matrix = cv2.getPerspectiveTransform(points, target)
