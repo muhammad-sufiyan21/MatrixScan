@@ -103,13 +103,11 @@ def image_to_rgb(uploaded):
 def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
     h, w = rgb.shape[:2]
     
-    # Smart margin-based perspective crop jo hamesha poora page theek se pakdega
-    # Yahan hum image ke thode andar se corners uthate hain taake background cut jaye
     points = np.float32([
-        [w * 0.08, h * 0.05],   # Top-left
-        [w * 0.92, h * 0.05],   # Top-right
-        [w * 0.95, h * 0.95],   # Bottom-right
-        [w * 0.05, h * 0.95]    # Bottom-left
+        [w * 0.08, h * 0.05],
+        [w * 0.92, h * 0.05],
+        [w * 0.95, h * 0.95],
+        [w * 0.05, h * 0.95]
     ])
     
     out_w, out_h = 1200, 1600
@@ -126,17 +124,7 @@ def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
     if mode == "Grayscale":
         gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
         return cv2.cvtColor(gray_w, cv2.COLOR_GRAY2RGB)
-    return warped        
-        target = np.float32([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]])
-        matrix = cv2.getPerspectiveTransform(rect, target)
-        warped = cv2.warpPerspective(rgb, matrix, (out_w, out_h))
-    else:
-        points = np.float32([[w * .05, h * .05], [w * .95, h * .05], [w * .95, h * .95], [w * .05, h * .95]])
-        out_w, out_h = 1000, 1400
-        target = np.float32([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]])
-        matrix = cv2.getPerspectiveTransform(points, target)
-        warped = cv2.warpPerspective(rgb, matrix, (out_w, out_h))
-
+    return warped
     if mode == "Black & White":
         gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
         bw = cv2.adaptiveThreshold(gray_w, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
