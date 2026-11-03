@@ -4,6 +4,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+import tempfile
 
 import cv2
 import numpy as np
