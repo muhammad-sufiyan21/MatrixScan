@@ -100,7 +100,68 @@ def safe_filename(name: str) -> str:
 def image_to_rgb(uploaded):
     img = Image.open(uploaded).convert("RGB")
     return np.array(img)
+def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
+    h, w = rgb.shape[:2]
+    
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 75, 200)
+    
+    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    
+    screenCnt = None
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            if cv2.contourArea(approx) > (h * w * 0.15):
+                screenCnt = approx
+                break
+            
+    if screenCnt is not None:
+        pts = screenCnt.reshape(4, 2)
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        
+        (tl, tr, br, bl) = rect
+        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+        maxWidth = max(int(widthA), int(widthB))
+        
+        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+        maxHeight = max(int(heightA), int(heightB))
+        
+        if maxWidth > 150 and maxHeight > 150:
+            dst = np.float32([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]])
+            M = cv2.getPerspectiveTransform(rect, dst)
+            warped = cv2.warpPerspective(rgb, M, (maxWidth, maxHeight))
+        else:
+            screenCnt = None
+            
+    if screenCnt is None:
+        points = np.float32([[w * 0.05, h * 0.05], [w * 0.95, h * 0.05], [w * 0.95, h * 0.95], [w * 0.05, h * 0.95]])
+        maxWidth, maxHeight = 1200, 1600
+        target = np.float32([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]])
+        M = cv2.getPerspectiveTransform(points, target)
+        warped = cv2.warpPerspective(rgb, M, (maxWidth, maxHeight))
 
+    if mode == "Black & White":
+        gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+        bw = cv2.adaptiveThreshold(gray_w, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 21, 11)
+        return cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
+    if mode == "Grayscale":
+        gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+        return cv2.cvtColor(gray_w, cv2.COLOR_GRAY2RGB)
+    return warped
+    
 def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
     h, w = rgb.shape[:2]
     
