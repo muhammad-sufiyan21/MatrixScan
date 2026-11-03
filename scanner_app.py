@@ -101,7 +101,62 @@ def image_to_rgb(uploaded):
     return np.array(img)
 
 def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    annotated = cv2.Canny(blur, 75, 200)
+    
+    contours, _ = cv2.findContours(annotated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+    
+    screenCnt = None
     h, w = rgb.shape[:2]
+    
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            screenCnt = approx
+            break
+            
+    if screenCnt is not None:
+        pts = screenCnt.reshape(4, 2)
+        
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        
+        (tl, tr, br, bl) = rect
+        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+        out_w = max(int(widthA), int(widthB))
+        
+        heightA = np.sqrt((tr[0] - br[0]) ** 2 + (tr[1] - br[1]) ** 2)
+        heightB = np.sqrt((tl[0] - bl[0]) ** 2 + (tl[1] - bl[1]) ** 2)
+        out_h = max(int(heightA), int(heightB))
+        
+        target = np.float32([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]])
+        matrix = cv2.getPerspectiveTransform(rect, target)
+        warped = cv2.warpPerspective(rgb, matrix, (out_w, out_h))
+    else:
+        points = np.float32([[w * .05, h * .05], [w * .95, h * .05], [w * .95, h * .95], [w * .05, h * .95]])
+        out_w, out_h = 1000, 1400
+        target = np.float32([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]])
+        matrix = cv2.getPerspectiveTransform(points, target)
+        warped = cv2.warpPerspective(rgb, matrix, (out_w, out_h))
+
+    if mode == "Black & White":
+        gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+        bw = cv2.adaptiveThreshold(gray_w, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 21, 11)
+        return cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
+    if mode == "Grayscale":
+        gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+        return cv2.cvtColor(gray_w, cv2.COLOR_GRAY2RGB)
+    return warped
     # Current automatic crop is a gentle edge margin. This can later be replaced
     # with contour-based document-edge detection and draggable corner controls.
     points = np.float32([
