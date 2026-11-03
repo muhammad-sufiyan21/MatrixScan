@@ -98,8 +98,8 @@ def safe_filename(name: str) -> str:
     return (name[:70] or "Scanned_Document")
 
 def image_to_rgb(uploaded):
-    bytes_data = uploaded.read()
-    img = Image.open(io.BytesIO(bytes_data)).convert("RGB")
+    uploaded.seek(0)
+    img = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
     return np.array(img)
 
 def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
