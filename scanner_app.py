@@ -175,12 +175,40 @@ def find_document_corners(rgb):
     cs, _ = cv2.findContours(th2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates += sorted(cs, key=cv2.contourArea, reverse=True)[:3]
 
+    # Method 4: GrabCut, seeded with "bright = paper, very dark = background"
+    try:
+        sm = cv2.GaussianBlur(gray, (0, 0), 3)
+        gm = np.full((h, w), cv2.GC_PR_BGD, np.uint8)
+        gm[sm > np.percentile(sm, 60)] = cv2.GC_PR_FGD
+        gm[sm < np.percentile(sm, 20)] = cv2.GC_BGD
+        cv2.grabCut(small, gm, None, np.zeros((1, 65)), np.zeros((1, 65)), 5, cv2.GC_INIT_WITH_MASK)
+        fgm = ((gm == cv2.GC_FGD) | (gm == cv2.GC_PR_FGD)).astype(np.uint8) * 255
+        fgm = cv2.morphologyEx(fgm, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), iterations=2)
+        cs, _ = cv2.findContours(fgm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates += sorted(cs, key=cv2.contourArea, reverse=True)[:2]
+    except cv2.error:
+        pass
+
     margin = 0.015 * max(w, h)
 
     def border_hits(q):
         return int(sum((x < margin or y < margin or x > w - margin or y > h - margin) for x, y in q))
 
-    best, best_score = None, -1.0
+    def edge_contrast(q):
+        """Paper is clearly brighter inside than in a band just outside its edges."""
+        poly = q.astype(np.int32).reshape(-1, 1, 2)
+        m = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(m, [poly], 255)
+        r = max(5, int(0.025 * max(w, h)))
+        kk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        inner = cv2.erode(m, kk)
+        inner_ring = cv2.subtract(m, inner)
+        outer_ring = cv2.subtract(cv2.dilate(m, kk), m)
+        if inner_ring.sum() == 0 or outer_ring.sum() == 0:
+            return 0.0
+        return float(gray[inner_ring > 0].mean() - gray[outer_ring > 0].mean())
+
+    best, best_score, best_c = None, 0.0, None
     for c in candidates:
         if cv2.contourArea(c) < 0.12 * w * h:
             continue
@@ -191,12 +219,29 @@ def find_document_corners(rgb):
         hits = border_hits(quad)
         if hits >= 3 or a > 0.985 * w * h:   # just the photo frame, not a page
             continue
-        score = a * (1.0 - 0.25 * hits)      # pages usually sit inside the photo
+        contrast = edge_contrast(quad)
+        if contrast < 12:                    # edge between marble and marble, not a page
+            continue
+        score = (a / (w * h)) * min(contrast, 80) * (1.0 - 0.2 * hits)
         if score > best_score:
-            best, best_score = quad, score
+            best, best_score, best_c = quad, score, c
     if best is None:
         return None
+    if _max_angle_error(best) > 20:           # page is cut by the photo edge -> keep it undistorted
+        hull = cv2.convexHull(best_c)
+        best = cv2.boxPoints(cv2.minAreaRect(hull)).astype("float32")
     return _order_points(best / scale)
+
+
+def _max_angle_error(q):
+    q = _order_points(q)
+    worst = 0.0
+    for i in range(4):
+        a, b, c = q[i - 1], q[i], q[(i + 1) % 4]
+        v1, v2 = a - b, c - b
+        cosang = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9)
+        worst = max(worst, abs(np.degrees(np.arccos(np.clip(cosang, -1, 1))) - 90))
+    return worst
 
 
 def _warp(rgb, rect):
@@ -211,7 +256,8 @@ def _warp(rgb, rect):
         out_w, out_h = int(out_w * s), int(out_h * s)
     dst = np.float32([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]])
     M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(rgb, M, (out_w, out_h), flags=cv2.INTER_CUBIC)
+    return cv2.warpPerspective(rgb, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
 
 
 def _flatten_light(channel):
@@ -252,12 +298,14 @@ def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
         g = np.clip((norm.astype("float32") - lo) * 255.0 / max(hi - lo, 1), 0, 255).astype("uint8")
         return cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
 
-    # Black & White: smooth, clean text (no speckle)
-    blockSize = max(25, (min(norm.shape) // 25) | 1)
-    bw = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, blockSize, 12)
-    bw = cv2.medianBlur(bw, 3)
-    m = max(6, min(bw.shape) // 120)          # clean white margin, hides leftover edge shadow
+    # Black & White: CamScanner-style. Ink goes solid black, paper pure white, faint ruled lines stay light.
+    f = norm.astype("float32")
+    g = np.clip((f - 70.0) / (205.0 - 70.0), 0, 1)
+    g = g ** 1.35                                   # slightly darker midtones -> sturdier handwriting
+    bw = (g * 255).astype("uint8")
+    blur = cv2.GaussianBlur(bw, (0, 0), 1.2)
+    bw = cv2.addWeighted(bw, 1.6, blur, -0.6, 0)      # gentle sharpening
+    m = max(6, min(bw.shape) // 120)                # clean white margin, hides leftover edge shadow
     bw[:m, :] = 255; bw[-m:, :] = 255; bw[:, :m] = 255; bw[:, -m:] = 255
     return cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
 
@@ -390,163 +438,4 @@ elif st.session_state.page == "auth" and not st.session_state.user:
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         st.error("Authentication is not configured yet. Follow SETUP.md to connect Supabase before using login.")
     mode = st.segmented_control("Account", ["Log in", "Create account"], default="Log in")
-    email = st.text_input("Email address", placeholder="you@example.com")
-    password = st.text_input("Password", type="password", placeholder="At least 8 characters")
-    if mode == "Create account":
-        if st.button("Create my account", use_container_width=True):
-            if not email or "@" not in email or len(password) < 8:
-                st.error("Enter a valid email and a password with at least 8 characters.")
-            else:
-                try:
-                    response = get_supabase().auth.sign_up({"email": email, "password": password})
-                    if response.user and response.session:
-                        st.session_state.user = {"id": response.user.id, "email": response.user.email}
-                        st.session_state.access_token = response.session.access_token
-                        st.session_state.refresh_token = response.session.refresh_token
-                        set_page("dashboard")
-                        st.rerun()
-                    else:
-                        st.success("Account created. Check your email to confirm it, then log in.")
-                except Exception as e:
-                    st.error(f"Could not create account: {e}")
-    else:
-        if st.button("Log in securely", use_container_width=True):
-            try:
-                response = get_supabase().auth.sign_in_with_password({"email": email, "password": password})
-                st.session_state.user = {"id": response.user.id, "email": response.user.email}
-                st.session_state.access_token = response.session.access_token
-                st.session_state.refresh_token = response.session.refresh_token
-                set_page("dashboard")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Login failed. Check your details and try again. ({e})")
-    if st.button("← Back to welcome"):
-        set_page("landing")
-        st.rerun()
-
-# -------------------- DASHBOARD --------------------
-elif st.session_state.user and st.session_state.page == "dashboard":
-    topbar()
-    email = st.session_state.user["email"]
-    display = email.split("@")[0].replace(".", " ").replace("_", " ").title()
-    st.markdown(f'<div class="eyebrow">YOUR WORKSPACE</div><h1>Welcome back, {display} ✦</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="tagline">Everything you scan, organized in one place.</p>', unsafe_allow_html=True)
-    if st.button("＋  Create a new scan", use_container_width=True):
-        st.session_state.processed_pages = []
-        st.session_state.pdf_bytes = None
-        set_page("scanner")
-        st.rerun()
-    st.markdown("## My Scans")
-    try:
-        scans = list_scans()
-        if not scans:
-            st.markdown('<div class="panel" style="text-align:center"><div style="font-size:2.3rem">📄</div><h3>Your library is ready</h3><p class="small-muted">Your saved PDFs will appear here. Create your first scan to get started.</p></div>', unsafe_allow_html=True)
-        else:
-            for scan in scans:
-                with st.container(border=True):
-                    c1, c2, c3 = st.columns([3, 1, 1], vertical_alignment="center")
-                    with c1:
-                        st.markdown(f"**📄 {scan['name']}.pdf**")
-                        st.caption(f"{scan.get('page_count', 1)} page(s) · {scan.get('created_at', '')[:10]}")
-                    with c2:
-                        if st.button("Share", key=f"share_{scan['id']}"):
-                            try:
-                                url = signed_pdf_url(scan["storage_path"])
-                                st.session_state[f"url_{scan['id']}"] = url
-                            except Exception as e:
-                                st.error(f"Could not create share link: {e}")
-                    with c3:
-                        if st.button("Delete", key=f"delete_{scan['id']}"):
-                            try:
-                                sb = get_supabase()
-                                sb.storage.from_(BUCKET).remove([scan["storage_path"]])
-                                sb.table("scans").delete().eq("id", scan["id"]).eq("user_id", user_id()).execute()
-                                st.success("Deleted.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Delete failed: {e}")
-                    url = st.session_state.get(f"url_{scan['id']}")
-                    if url:
-                        st.code(url, language=None)
-                        wa = "https://wa.me/?text=" + __import__("urllib.parse").parse.quote(f"My MatrixScan PDF: {url}")
-                        st.link_button("Share on WhatsApp", wa)
-                        st.link_button("Open / download PDF", url)
-    except Exception as e:
-        st.error(f"Could not load your library: {e}")
-        st.info("Check that the Supabase SQL setup and private storage bucket have been created.")
-
-# -------------------- SCANNER --------------------
-elif st.session_state.user and st.session_state.page == "scanner":
-    topbar()
-    if st.button("← Dashboard"):
-        set_page("dashboard")
-        st.rerun()
-    st.markdown('<div class="eyebrow">STEP 01 · ADD YOUR PAGES</div>', unsafe_allow_html=True)
-    st.title("Let's scan something.")
-    uploads = st.file_uploader("Choose one or more document photos", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
-    mode = st.radio("Choose your scan style", ["Black & White", "Grayscale", "Color Original"], horizontal=True)
-    if uploads:
-        st.markdown(f"**{len(uploads)} page(s) selected**")
-        preview_cols = st.columns(min(3, len(uploads)))
-        for i, up in enumerate(uploads):
-            with preview_cols[i % len(preview_cols)]:
-                st.image(up, caption=f"Page {i+1}", use_container_width=True)
-        if st.button("Start scanning  →", use_container_width=True):
-            st.markdown('<div class="scan-stage"><div class="eyebrow">MATRIXSCAN ENGINE</div><h3>Scanning your pages…</h3><div class="scan-paper"><div class="scan-lines"></div></div><p class="small-muted">Aligning · Enhancing · Preparing your PDF</p></div>', unsafe_allow_html=True)
-            progress = st.progress(0)
-            processed = []
-            try:
-                for i, up in enumerate(uploads):
-                    up.seek(0)
-                    rgb = image_to_rgb(up)
-                    processed.append(scan_image(rgb, mode))
-                    progress.progress(int((i + 1) / len(uploads) * 100))
-                st.session_state.processed_pages = processed
-                st.session_state.pdf_bytes = make_pdf(processed)
-                st.session_state.pdf_name = "My_Scan"
-                set_page("results")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Scanning failed: {e}")
-    else:
-        st.markdown('<div class="panel" style="text-align:center"><div style="font-size:2rem">＋</div><b>Add your document photos</b><p class="small-muted">You can select multiple images to make a multi-page PDF.</p></div>', unsafe_allow_html=True)
-
-# -------------------- RESULTS --------------------
-elif st.session_state.user and st.session_state.page == "results":
-    topbar()
-    if st.button("← Back to scanner"):
-        set_page("scanner")
-        st.rerun()
-    st.markdown('<div class="eyebrow">STEP 02 · REVIEW & EXPORT</div>', unsafe_allow_html=True)
-    st.title("Your scan is ready. ✨")
-    pages = st.session_state.processed_pages
-    if pages:
-        st.success(f"Successfully scanned {len(pages)} page(s).")
-        for i, page in enumerate(pages):
-            with st.expander(f"Preview page {i+1}", expanded=(i == 0)):
-                st.image(page, use_container_width=True)
-        st.markdown("### Name your PDF")
-        name = st.text_input("PDF filename (without .pdf)", value=st.session_state.pdf_name)
-        st.session_state.pdf_name = safe_filename(name)
-        pdf_bytes = st.session_state.pdf_bytes or make_pdf(pages)
-        st.download_button("↓  Download PDF", data=pdf_bytes,
-                           file_name=f"{st.session_state.pdf_name}.pdf",
-                           mime="application/pdf", use_container_width=True)
-        if st.button("☁️  Save to My Scans", use_container_width=True):
-            try:
-                with st.spinner("Saving securely to your account…"):
-                    save_pdf_to_cloud(pdf_bytes, st.session_state.pdf_name)
-                st.success("Saved to your private MatrixScan library.")
-                set_page("dashboard")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Could not save PDF: {e}")
-                st.info("Check Supabase setup and storage policies in SETUP.md.")
-        st.caption("Tip: use your browser's share menu after downloading, or save the PDF and attach it in WhatsApp/email.")
-    else:
-        st.warning("No scanned pages found. Go back and upload images.")
-
-# -------------------- FALLBACK --------------------
-else:
-    st.session_state.page = "landing"
-    st.rerun()
+    email = st.text_input("Email address", placeholder="you@example.
