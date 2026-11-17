@@ -437,4 +437,111 @@ def topbar():
 
 # -------------------- LANDING --------------------
 if st.session_state.page == "landing":
-    st.markdown('<div class="eyebrow">THE DOCUMENT SCANNER, REIMAGINE
+    st.markdown('<div class="eyebrow">THE DOCUMENT SCANNER, REIMAGINED</div>', unsafe_allow_html=True)
+    a, b = st.columns([1.55, 1], vertical_alignment="center")
+    with a:
+        st.markdown('<div class="brand">MatrixScan.</div>', unsafe_allow_html=True)
+        st.markdown('<p class="tagline">Turn everyday photos into clean, polished documents. Scan in color, grayscale or crisp black & white — then export a clean PDF in seconds. No sign-up needed.</p>', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Get started  →", use_container_width=True):
+                set_page("scanner")
+                st.rerun()
+        with c2:
+            if st.button("Explore features", use_container_width=True):
+                st.session_state.show_features = True
+        st.markdown('<p class="small-muted">Simple document scanning. Free and instant.</p>', unsafe_allow_html=True)
+    with b:
+        st.markdown("""
+        <div class="panel" style="text-align:center;padding:32px 18px;">
+          <div class="mascot">🤖</div>
+          <h2 style="margin-top:18px;">Ready when you are.</h2>
+          <p class="small-muted">Your little scanning assistant is waiting to help.</p>
+          <div style="display:flex;gap:8px;justify-content:center;margin-top:18px;">
+            <span style="background:#34203a;padding:8px 12px;border-radius:30px;">✦ Smart scan</span>
+            <span style="background:#34203a;padding:8px 12px;border-radius:30px;">✦ PDF export</span>
+          </div>
+        </div>""", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+    f1, f2, f3 = st.columns(3)
+    for col, emoji, title, desc in [
+        (f1, "📷", "Scan your way", "Choose color, grayscale or black & white."),
+        (f2, "📚", "Multi-page PDFs", "Combine several images into one document."),
+        (f3, "🔓", "No account needed", "Open the app, scan and download. Nothing to sign up for.")
+    ]:
+        with col:
+            st.markdown(f'<div class="feature"><div style="font-size:1.6rem">{emoji}</div><b>{title}</b><p class="small-muted">{desc}</p></div>', unsafe_allow_html=True)
+
+# -------------------- SCANNER --------------------
+elif st.session_state.page == "scanner":
+    topbar()
+    if st.button("← Home"):
+        set_page("landing")
+        st.rerun()
+    st.markdown('<div class="eyebrow">STEP 01 · ADD YOUR PAGES</div>', unsafe_allow_html=True)
+    st.title("Let's scan something.")
+    uploads = st.file_uploader("Choose one or more document photos", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+    mode = st.radio("Choose your scan style", ["Black & White", "Grayscale", "Color Original"], horizontal=True)
+    if uploads:
+        st.markdown(f"**{len(uploads)} page(s) selected**")
+        st.caption("Each page is cropped automatically. Open a page to check or change the crop.")
+        page_inputs = []
+        for i, up in enumerate(uploads):
+            key = f"{up.name}_{up.size}_{i}"
+            with st.expander(f"Page {i+1} · {up.name}", expanded=(len(uploads) == 1)):
+                with st.spinner("Finding the page edges…"):
+                    rgb, auto = page_data(up, key)
+                corners = crop_controls(rgb, auto, key)
+            page_inputs.append((rgb, corners))
+        if st.button("Start scanning  →", use_container_width=True):
+            st.markdown('<div class="scan-stage"><div class="eyebrow">MATRIXSCAN ENGINE</div><h3>Scanning your pages…</h3><div class="scan-paper"><div class="scan-lines"></div></div><p class="small-muted">Aligning · Enhancing · Preparing your PDF</p></div>', unsafe_allow_html=True)
+            progress = st.progress(0)
+            processed = []
+            try:
+                for i, (rgb, corners) in enumerate(page_inputs):
+                    processed.append(scan_image(rgb, mode, corners=corners))
+                    progress.progress(int((i + 1) / len(page_inputs) * 100))
+                st.session_state.processed_pages = processed
+                st.session_state.pdf_bytes = make_pdf(processed)
+                st.session_state.pdf_name = "My_Scan"
+                set_page("results")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Scanning failed: {e}")
+    else:
+        st.markdown('<div class="panel" style="text-align:center"><div style="font-size:2rem">＋</div><b>Add your document photos</b><p class="small-muted">You can select multiple images to make a multi-page PDF.</p></div>', unsafe_allow_html=True)
+
+# -------------------- RESULTS --------------------
+elif st.session_state.page == "results":
+    topbar()
+    if st.button("← Back to scanner"):
+        set_page("scanner")
+        st.rerun()
+    st.markdown('<div class="eyebrow">STEP 02 · REVIEW & EXPORT</div>', unsafe_allow_html=True)
+    st.title("Your scan is ready. ✨")
+    pages = st.session_state.processed_pages
+    if pages:
+        st.success(f"Successfully scanned {len(pages)} page(s).")
+        for i, page in enumerate(pages):
+            with st.expander(f"Preview page {i+1}", expanded=(i == 0)):
+                st.image(page, use_container_width=True)
+        st.markdown("### Name your PDF")
+        name = st.text_input("PDF filename (without .pdf)", value=st.session_state.pdf_name)
+        st.session_state.pdf_name = safe_filename(name)
+        pdf_bytes = st.session_state.pdf_bytes or make_pdf(pages)
+        st.download_button("↓  Download PDF", data=pdf_bytes,
+                           file_name=f"{st.session_state.pdf_name}.pdf",
+                           mime="application/pdf", use_container_width=True)
+        if st.button("＋  Scan another document", use_container_width=True):
+            st.session_state.processed_pages = []
+            st.session_state.pdf_bytes = None
+            set_page("scanner")
+            st.rerun()
+        st.caption("Tip: use your browser's share menu after downloading, or save the PDF and attach it in WhatsApp/email.")
+    else:
+        st.warning("No scanned pages found. Go back and upload images.")
+
+# -------------------- FALLBACK --------------------
+else:
+    st.session_state.page = "landing"
+    st.rerun()
