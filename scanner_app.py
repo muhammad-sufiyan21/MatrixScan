@@ -3,15 +3,15 @@ import os
 import re
 import time
 import uuid
-import tempfile
 from datetime import datetime, timezone
 
 import cv2
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 from supabase import create_client, Client
 
 # -------------------- CONFIG --------------------
@@ -97,72 +97,169 @@ def safe_filename(name: str) -> str:
     name = re.sub(r"\s+", "_", name).strip("_")
     return (name[:70] or "Scanned_Document")
 
-def image_to_rgb(uploaded):
-    uploaded.seek(0)
-    img = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
+def image_to_rgb(fileobj, max_side=2600):
+    """Read an uploaded image, fix phone rotation (EXIF) and limit the size."""
+    fileobj.seek(0)
+    img = Image.open(fileobj)
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_side:
+        s = max_side / max(w, h)
+        img = img.resize((int(w * s), int(h * s)), Image.LANCZOS)
     return np.array(img)
 
-def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
-    h, w = rgb.shape[:2]
-    
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 75, 200)
-    
-    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    
-    screenCnt = None
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            if cv2.contourArea(approx) > (h * w * 0.15):
-                screenCnt = approx
-                break
-            
-    if screenCnt is not None:
-        pts = screenCnt.reshape(4, 2)
-        rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)]
-        rect[2] = pts[np.argmax(s)]
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)]
-        rect[3] = pts[np.argmax(diff)]
-        
-        (tl, tr, br, bl) = rect
-        widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-        widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-        maxWidth = max(int(widthA), int(widthB))
-        
-        heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-        heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-        maxHeight = max(int(heightA), int(heightB))
-        
-        if maxWidth > 150 and maxHeight > 150:
-            dst = np.float32([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]])
-            M = cv2.getPerspectiveTransform(rect, dst)
-            warped = cv2.warpPerspective(rgb, M, (maxWidth, maxHeight))
-        else:
-            screenCnt = None
-            
-    if screenCnt is None:
-        points = np.float32([[w * 0.05, h * 0.05], [w * 0.95, h * 0.05], [w * 0.95, h * 0.95], [w * 0.05, h * 0.95]])
-        maxWidth, maxHeight = 1200, 1600
-        target = np.float32([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]])
-        M = cv2.getPerspectiveTransform(points, target)
-        warped = cv2.warpPerspective(rgb, M, (maxWidth, maxHeight))
 
-    if mode == "Black & White":
-        gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
-        bw = cv2.adaptiveThreshold(gray_w, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 21, 11)
-        return cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
+def _order_points(pts):
+    pts = np.asarray(pts, dtype="float32").reshape(4, 2)
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).ravel()
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
+    rect[1] = pts[np.argmin(d)]   # top-right
+    rect[3] = pts[np.argmax(d)]   # bottom-left
+    return rect
+
+
+def _quad_from_contour(cnt):
+    """Turn any contour into the best 4-corner polygon."""
+    hull = cv2.convexHull(cnt)
+    peri = cv2.arcLength(hull, True)
+    for eps in (0.015, 0.02, 0.03, 0.04, 0.05, 0.07, 0.09):
+        approx = cv2.approxPolyDP(hull, eps * peri, True)
+        if len(approx) == 4:
+            return approx.reshape(4, 2).astype("float32")
+    # fallback: tilted bounding rectangle
+    return cv2.boxPoints(cv2.minAreaRect(hull)).astype("float32")
+
+
+def _valid_quad(quad, w, h, min_frac=0.12):
+    area = cv2.contourArea(quad.reshape(-1, 1, 2))
+    if area < min_frac * w * h:
+        return False
+    return cv2.isContourConvex(quad.reshape(-1, 1, 2).astype("int32"))
+
+
+def find_document_corners(rgb):
+    """Return 4 corners (TL, TR, BR, BL) in original-image pixels, or None."""
+    H, W = rgb.shape[:2]
+    scale = 800.0 / max(H, W)
+    small = cv2.resize(rgb, (int(W * scale), int(H * scale)), interpolation=cv2.INTER_AREA)
+    h, w = small.shape[:2]
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    candidates = []
+
+    # Method 1: edges (works when the page has a clear border)
+    med = float(np.median(blur))
+    edges = cv2.Canny(blur, int(max(0, 0.66 * med)), int(min(255, 1.33 * med)))
+    edges = cv2.dilate(edges, k, iterations=2)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=2)
+    cs, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    candidates += sorted(cs, key=cv2.contourArea, reverse=True)[:5]
+
+    # Method 2: paper is brighter than the table (Otsu threshold)
+    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for m in (th, 255 - th):
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=3)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=2)
+        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates += sorted(cs, key=cv2.contourArea, reverse=True)[:3]
+
+    # Method 3: paper is low-saturation (white/grey) while the table is coloured
+    hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+    sat = cv2.GaussianBlur(hsv[:, :, 1], (7, 7), 0)
+    _, th2 = cv2.threshold(sat, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    th2 = cv2.morphologyEx(th2, cv2.MORPH_CLOSE, k, iterations=3)
+    cs, _ = cv2.findContours(th2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates += sorted(cs, key=cv2.contourArea, reverse=True)[:3]
+
+    margin = 0.015 * max(w, h)
+
+    def border_hits(q):
+        return int(sum((x < margin or y < margin or x > w - margin or y > h - margin) for x, y in q))
+
+    best, best_score = None, -1.0
+    for c in candidates:
+        if cv2.contourArea(c) < 0.12 * w * h:
+            continue
+        quad = _quad_from_contour(c)
+        if not _valid_quad(quad, w, h):
+            continue
+        a = cv2.contourArea(quad.reshape(-1, 1, 2))
+        hits = border_hits(quad)
+        if hits >= 3 or a > 0.985 * w * h:   # just the photo frame, not a page
+            continue
+        score = a * (1.0 - 0.25 * hits)      # pages usually sit inside the photo
+        if score > best_score:
+            best, best_score = quad, score
+    if best is None:
+        return None
+    return _order_points(best / scale)
+
+
+def _warp(rgb, rect):
+    tl, tr, br, bl = rect
+    wA = np.linalg.norm(br - bl); wB = np.linalg.norm(tr - tl)
+    hA = np.linalg.norm(tr - br); hB = np.linalg.norm(tl - bl)
+    out_w, out_h = int(max(wA, wB)), int(max(hA, hB))
+    # keep output at a sensible size
+    longest = max(out_w, out_h)
+    if longest > 2200:
+        s = 2200 / longest
+        out_w, out_h = int(out_w * s), int(out_h * s)
+    dst = np.float32([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]])
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(rgb, M, (out_w, out_h), flags=cv2.INTER_CUBIC)
+
+
+def _flatten_light(channel):
+    """Remove shadows / uneven light by dividing by the page background."""
+    h, w = channel.shape
+    k = max(31, (min(h, w) // 12) | 1)
+    bg = cv2.morphologyEx(channel, cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    bg = cv2.medianBlur(bg, 21)
+    bg = cv2.GaussianBlur(bg, (0, 0), k / 3)
+    norm = cv2.divide(channel, np.maximum(bg, 1), scale=255)
+    return norm
+
+
+def scan_image(rgb: np.ndarray, mode: str) -> np.ndarray:
+    corners = find_document_corners(rgb)
+    if corners is not None:
+        # trim ~1.5% inside the edge so no table/background is left at the borders
+        c = corners.mean(axis=0)
+        corners = (c + (corners - c) * 0.985).astype("float32")
+        warped = _warp(rgb, corners)
+    else:
+        warped = rgb.copy()          # no document found: keep the full photo, no stretching
+
+    if mode == "Color Original":
+        ch = [_flatten_light(warped[:, :, i]) for i in range(3)]
+        out = cv2.merge(ch)
+        out = cv2.convertScaleAbs(out, alpha=1.08, beta=-8)   # little extra contrast
+        return out
+
+    gray = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+    norm = _flatten_light(gray)
+    norm = cv2.fastNlMeansDenoising(norm, None, h=6, templateWindowSize=7, searchWindowSize=21)
+
     if mode == "Grayscale":
-        gray_w = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
-        return cv2.cvtColor(gray_w, cv2.COLOR_GRAY2RGB)
-    return warped
+        # push the paper to pure white, keep the ink dark
+        lo, hi = np.percentile(norm, 2), np.percentile(norm, 90)
+        g = np.clip((norm.astype("float32") - lo) * 255.0 / max(hi - lo, 1), 0, 255).astype("uint8")
+        return cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
+
+    # Black & White: smooth, clean text (no speckle)
+    blockSize = max(25, (min(norm.shape) // 25) | 1)
+    bw = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, blockSize, 12)
+    bw = cv2.medianBlur(bw, 3)
+    m = max(6, min(bw.shape) // 120)          # clean white margin, hides leftover edge shadow
+    bw[:m, :] = 255; bw[-m:, :] = 255; bw[:, :m] = 255; bw[:, -m:] = 255
+    return cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
 
 def make_pdf(images: list[np.ndarray]) -> bytes:
     buffer = io.BytesIO()
@@ -176,7 +273,7 @@ def make_pdf(images: list[np.ndarray]) -> bytes:
         iw, ih = pil.size
         scale = min((page_w - 48) / iw, (page_h - 48) / ih)
         draw_w, draw_h = iw * scale, ih * scale
-        pdf.drawImage(img_buffer, (page_w - draw_w) / 2, (page_h - draw_h) / 2,
+        pdf.drawImage(ImageReader(img_buffer), (page_w - draw_w) / 2, (page_h - draw_h) / 2,
                       width=draw_w, height=draw_h, preserveAspectRatio=True)
         pdf.showPage()
     pdf.save()
