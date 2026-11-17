@@ -439,7 +439,6 @@ elif st.session_state.page == "auth" and not st.session_state.user:
         st.error("Authentication is not configured yet. Follow SETUP.md to connect Supabase before using login.")
     mode = st.segmented_control("Account", ["Log in", "Create account"], default="Log in")
     email = st.text_input("Email address", placeholder="you@example.com")
-    email = st.text_input("Email address", placeholder="you@example.com")
     password = st.text_input("Password", type="password", placeholder="At least 8 characters")
     if mode == "Create account":
         if st.button("Create my account", use_container_width=True):
